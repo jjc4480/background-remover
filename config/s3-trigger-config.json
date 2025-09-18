@@ -1,0 +1,56 @@
+{
+  "LambdaFunctionConfigurations": [
+    {
+      "Id": "StaticJPG",
+      "LambdaFunctionArn": "arn:aws:lambda:ap-northeast-2:571946422859:function:background-remover",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "static/competition/applicant/"},
+            {"Name": "suffix", "Value": ".jpg"}
+          ]
+        }
+      }
+    },
+    {
+      "Id": "StaticPNG",
+      "LambdaFunctionArn": "arn:aws:lambda:ap-northeast-2:571946422859:function:background-remover",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "static/competition/applicant/"},
+            {"Name": "suffix", "Value": ".png"}
+          ]
+        }
+      }
+    },
+    {
+      "Id": "StaticJPEG",
+      "LambdaFunctionArn": "arn:aws:lambda:ap-northeast-2:571946422859:function:background-remover",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "static/competition/applicant/"},
+            {"Name": "suffix", "Value": ".jpeg"}
+          ]
+        }
+      }
+    },
+    {
+      "Id": "StaticWEBP",
+      "LambdaFunctionArn": "arn:aws:lambda:ap-northeast-2:571946422859:function:background-remover",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "static/competition/applicant/"},
+            {"Name": "suffix", "Value": ".webp"}
+          ]
+        }
+      }
+    }
+  ]
+}

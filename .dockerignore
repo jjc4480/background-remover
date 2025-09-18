@@ -1,0 +1,43 @@
+# Python cache files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Git files
+.git
+.gitignore
+
+# Environment files
+.env
+.env.example
+venv/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+*.log
+
+# Test files and directories
+bg_remove_test_images/
+tests/
+test-event.json
+
+# Documentation
+README.md
+
+# Scripts (not needed in container)
+scripts/
+deploy.sh
+
+# Config files (not needed in container)
+config/
+
+# Local runner (not needed in Lambda container)
+src/local_runner.py

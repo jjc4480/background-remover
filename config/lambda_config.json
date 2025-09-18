@@ -1,0 +1,17 @@
+{
+  "function_name": "background-remover",
+  "memory_size": 10240,
+  "timeout": 900,
+  "ephemeral_storage": 10240,
+  "environment": {
+    "NUMBA_CACHE_DIR": "/tmp",
+    "NUMBA_DISABLE_JIT": "1",
+    "U2NET_HOME": "/tmp",
+    "HOME": "/tmp"
+  },
+  "s3_bucket": "s3Bucket",
+  "s3_prefix": "prefix",
+  "supported_formats": ["jpg", "jpeg", "png", "webp"],
+  "model": "birefnet-general",
+  "output_suffix": "_bg_removed"
+}
