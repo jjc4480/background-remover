@@ -53,10 +53,11 @@ test_*.webp
 # Logs
 *.log
 logs/
+bg_remove_log.txt
 
 # Environment
 .env
 .env.local
 
 # Docker
-docker-compose.override.yml
+docker-compose.override.yml.env
