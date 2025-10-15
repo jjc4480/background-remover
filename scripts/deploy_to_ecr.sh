@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# Load .env file if it exists
+if [ -f .env ]; then
+    echo "Loading environment variables from .env file..."
+    export $(grep -v '^#' .env | xargs)
+fi
+
 # Configuration - use environment variables with defaults
 AWS_PROFILE="${AWS_PROFILE:-default}"
 AWS_REGION="${AWS_REGION:-ap-northeast-2}"
