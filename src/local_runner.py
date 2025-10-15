@@ -65,10 +65,12 @@ def process_directory(input_dir, output_dir=None, model='birefnet-general'):
         return
 
     if output_dir is None:
-        output_dir = input_dir
+        # 기본 출력 디렉토리는 bg_remove_test_output/
+        output_dir = Path("bg_remove_test_output")
     else:
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # 지원되는 이미지 확장자
     supported_formats = {'.jpg', '.jpeg', '.png', '.webp'}
