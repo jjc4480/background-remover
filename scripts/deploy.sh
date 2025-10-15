@@ -1,11 +1,7 @@
 #!/bin/bash
 
-# Configuration
-AWS_PROFILE="imssam_jjchan"  # AWS Profile to use
-AWS_REGION="ap-northeast-2"  # Change to your AWS region
-AWS_ACCOUNT_ID="571946422859"
-ECR_REPOSITORY_NAME="background-remover-lambda"
-IMAGE_TAG="latest"
+# Full deployment script: ECR + Lambda
+# This script runs both deploy_to_ecr.sh and deploy_lambda.sh
 
 # Colors for output
 RED='\033[0;31m'
@@ -13,71 +9,31 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting deployment of Background Remover Lambda to ECR...${NC}"
+# Get script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# Check if AWS CLI is installed
-if ! command -v aws &> /dev/null; then
-    echo -e "${RED}AWS CLI is not installed. Please install it first.${NC}"
-    exit 1
-fi
+echo -e "${GREEN}Starting full deployment: ECR + Lambda...${NC}"
+echo ""
 
-# Check if Docker is running
-if ! docker info &> /dev/null; then
-    echo -e "${RED}Docker is not running. Please start Docker first.${NC}"
-    exit 1
-fi
-
-# Get AWS Account ID
-if [ -z "$AWS_ACCOUNT_ID" ]; then
-    echo -e "${RED}Failed to get AWS Account ID. Please check your AWS credentials.${NC}"
-    exit 1
-fi
-
-echo -e "${YELLOW}AWS Account ID: $AWS_ACCOUNT_ID${NC}"
-echo -e "${YELLOW}Region: $AWS_REGION${NC}"
-echo -e "${YELLOW}Repository: $ECR_REPOSITORY_NAME${NC}"
-
-# Create ECR repository if it doesn't exist
-echo -e "${GREEN}Creating ECR repository if it doesn't exist...${NC}"
-aws ecr describe-repositories --repository-names $ECR_REPOSITORY_NAME --region $AWS_REGION --profile $AWS_PROFILE 2>/dev/null
-if [ $? -ne 0 ]; then
-    aws ecr create-repository --repository-name $ECR_REPOSITORY_NAME --region $AWS_REGION --profile $AWS_PROFILE
-    echo -e "${GREEN}Repository created successfully${NC}"
-else
-    echo -e "${YELLOW}Repository already exists${NC}"
-fi
-
-# Get login token and login to ECR
-echo -e "${GREEN}Logging into ECR...${NC}"
-aws ecr get-login-password --region $AWS_REGION --profile $AWS_PROFILE | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+# Step 1: Deploy to ECR
+echo -e "${YELLOW}Step 1/2: Deploying to ECR...${NC}"
+bash "$SCRIPT_DIR/deploy_to_ecr.sh"
 
 if [ $? -ne 0 ]; then
-    echo -e "${RED}Failed to login to ECR${NC}"
+    echo -e "${RED}ECR deployment failed. Aborting.${NC}"
     exit 1
 fi
 
-# Build Docker image
-echo -e "${GREEN}Building Docker image...${NC}"
-docker buildx build --platform linux/amd64 --provenance=false -t $ECR_REPOSITORY_NAME:$IMAGE_TAG --load .
+echo ""
+
+# Step 2: Update Lambda
+echo -e "${YELLOW}Step 2/2: Updating Lambda function...${NC}"
+bash "$SCRIPT_DIR/deploy_lambda.sh"
 
 if [ $? -ne 0 ]; then
-    echo -e "${RED}Failed to build Docker image${NC}"
+    echo -e "${RED}Lambda update failed.${NC}"
     exit 1
 fi
 
-# Tag image
-echo -e "${GREEN}Tagging image...${NC}"
-docker tag $ECR_REPOSITORY_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME:$IMAGE_TAG
-
-# Push image to ECR
-echo -e "${GREEN}Pushing image to ECR...${NC}"
-docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME:$IMAGE_TAG
-
-if [ $? -eq 0 ]; then
-    echo -e "${GREEN}✅ Deployment completed successfully!${NC}"
-    echo -e "${GREEN}Image URI: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME:$IMAGE_TAG${NC}"
-    echo -e "${YELLOW}You can now create/update your Lambda function with this image.${NC}"
-else
-    echo -e "${RED}Failed to push image to ECR${NC}"
-    exit 1
-fi
+echo ""
+echo -e "${GREEN}✅ Full deployment completed successfully!${NC}"
