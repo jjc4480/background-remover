@@ -2,11 +2,17 @@
 MediaPipe 기반 얼굴 및 포즈 감지 모듈
 정확한 얼굴 랜드마크와 신체 포즈를 감지하여 더 정확한 크롭 제공
 """
+import os
 import cv2
 import numpy as np
 from PIL import Image
 import mediapipe as mp
 import logging
+
+# Lambda 환경에서 MediaPipe 모델을 /tmp에 다운로드하도록 설정
+if os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
+    os.environ['MEDIAPIPE_RESOURCE_DIR'] = '/tmp/mediapipe'
+    os.makedirs('/tmp/mediapipe', exist_ok=True)
 
 logger = logging.getLogger(__name__)
 
