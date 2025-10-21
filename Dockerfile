@@ -1,12 +1,13 @@
 FROM public.ecr.aws/lambda/python:3.12
 
 # Install system dependencies for image processing
-RUN yum update -y && \
-    yum install -y \
+RUN dnf update -y && \
+    dnf install -y \
     libgomp \
     gcc \
+    gcc-c++ \
     python3-devel \
-    && yum clean all
+    && dnf clean all
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
