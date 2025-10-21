@@ -7,6 +7,7 @@ RUN dnf update -y && \
     gcc \
     gcc-c++ \
     python3-devel \
+    mesa-libGL \
     && dnf clean all
 
 # Copy requirements and install Python dependencies
