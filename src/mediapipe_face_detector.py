@@ -9,12 +9,9 @@ from PIL import Image
 import mediapipe as mp
 import logging
 
-# Lambda 환경에서 MediaPipe 모델을 /tmp에 다운로드하도록 설정
-if os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
-    os.environ['MEDIAPIPE_RESOURCE_DIR'] = '/tmp/mediapipe'
-    os.makedirs('/tmp/mediapipe', exist_ok=True)
-
 logger = logging.getLogger(__name__)
+
+# MediaPipe 환경변수는 lambda_function.py에서 먼저 설정됨
 
 
 class MediaPipeFaceDetector:
@@ -33,13 +30,13 @@ class MediaPipeFaceDetector:
             self.face_mesh = self.mp_face_mesh.FaceMesh(
                 static_image_mode=True,
                 max_num_faces=1,
-                refine_landmarks=True,
+                refine_landmarks=False,  # True → False (메모리 절약)
                 min_detection_confidence=0.5
             )
         if self.pose is None:
             self.pose = self.mp_pose.Pose(
                 static_image_mode=True,
-                model_complexity=2,
+                model_complexity=0,  # 2 → 0 (가장 가벼운 모델)
                 enable_segmentation=False,
                 min_detection_confidence=0.5
             )
