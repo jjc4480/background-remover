@@ -3,12 +3,20 @@
 Lambda와 로컬 환경에서 공통으로 사용
 """
 import os
+
+# 리소스 사용량 제한 (Lambda 환경에서도 적용 - 메모리 최적화)
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+os.environ['TF_NUM_INTEROP_THREADS'] = '1'
+os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
+
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance
 from rembg import remove, new_session
 import cv2
 from scipy.ndimage import gaussian_filter
-from skimage import exposure
 import logging
 
 logger = logging.getLogger(__name__)
@@ -36,11 +44,12 @@ def get_mediapipe_detector():
             _mediapipe_detector = False  # 실패 표시
     return _mediapipe_detector if _mediapipe_detector is not False else None
 
+# 이미지 처리 설정
+MAX_DIMENSION = 1500          # 입력 이미지 최대 가로/세로
+
 # 상반신 표준화 설정 (증명사진 스타일)
 STANDARD_OUTPUT_WIDTH = 600   # 표준 출력 너비
 STANDARD_OUTPUT_HEIGHT = 800  # 표준 출력 높이
-SHOULDER_TO_TOP_RATIO = 0.35  # 어깨에서 상단까지 비율 (머리 공간)
-
 # 최종 버전별 고정 크기
 VERSION1_TARGET_WIDTH = 600   # 버전1: 상반신 고정 너비 (증명사진) - 480 -> 600
 VERSION1_TARGET_HEIGHT = 640  # 버전1: 상반신 고정 높이
@@ -60,6 +69,7 @@ class BackgroundRemover:
         """
         self.model = model
         self.session = None
+        self._face_cascade = None
 
     def _create_session(self):
         """모델 세션 생성"""
@@ -89,6 +99,17 @@ class BackgroundRemover:
         # 세션 생성 (최초 1회)
         self._create_session()
 
+        # 메모리 최적화: 큰 이미지를 적절한 크기로 줄이기
+        original_width, original_height = input_image.size
+
+        if original_width > MAX_DIMENSION or original_height > MAX_DIMENSION:
+            # 비율 유지하면서 리사이즈
+            ratio = min(MAX_DIMENSION / original_width, MAX_DIMENSION / original_height)
+            new_width = int(original_width * ratio)
+            new_height = int(original_height * ratio)
+            input_image = input_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            logger.info(f"[{filename}] Resized for memory: {original_width}x{original_height} -> {new_width}x{new_height}")
+
         # 배경 제거
         logger.info(f"[{filename}] Removing background...")
         if self.session:
@@ -106,36 +127,28 @@ class BackgroundRemover:
         detector = get_mediapipe_detector()
 
         if detector is None:
-            # MediaPipe 실패 시 Haar Cascade로 fallback
             logger.warning(f"[{filename}] MediaPipe not available, using Haar Cascade fallback")
-            version1 = self._normalize_upper_body(output_image, filename=filename)
-            version2 = self._create_circular_face_crop_from_normalized(version1.copy(), filename=filename)
-
-            # 고정 크기로 리사이즈
-            version1 = self._resize_to_fixed_size(version1, VERSION1_TARGET_WIDTH, VERSION1_TARGET_HEIGHT)
-            version2 = self._resize_to_fixed_size(version2, VERSION2_TARGET_WIDTH, VERSION2_TARGET_HEIGHT)
-
-            return version1, version2
+            return self._haar_cascade_fallback(output_image, filename)
 
         # MediaPipe 감지
         detection = detector.detect_face_and_body(output_image, filename=filename)
 
         if detection is None:
-            # 감지 실패 시 Haar Cascade로 fallback
             logger.warning(f"[{filename}] MediaPipe detection failed, using Haar Cascade fallback")
-            version1 = self._normalize_upper_body(output_image, filename=filename)
-            version2 = self._create_circular_face_crop_from_normalized(version1.copy(), filename=filename)
-
-            # 고정 크기로 리사이즈
-            version1 = self._resize_to_fixed_size(version1, VERSION1_TARGET_WIDTH, VERSION1_TARGET_HEIGHT)
-            version2 = self._resize_to_fixed_size(version2, VERSION2_TARGET_WIDTH, VERSION2_TARGET_HEIGHT)
-
-            return version1, version2
+            return self._haar_cascade_fallback(output_image, filename)
 
         # MediaPipe 기반 최종 버전 생성
         version1 = self._create_final_upper_body(output_image.copy(), detection, filename=filename)
         version2 = self._create_final_circular_crop_wide(version1.copy(), detection, filename=filename)
 
+        return version1, version2
+
+    def _haar_cascade_fallback(self, image, filename="unknown"):
+        """Haar Cascade 기반 fallback 처리 (MediaPipe 사용 불가 시)"""
+        version1 = self._normalize_upper_body(image, filename=filename)
+        version2 = self._create_circular_face_crop_from_normalized(version1.copy(), filename=filename)
+        version1 = self._resize_to_fixed_size(version1, VERSION1_TARGET_WIDTH, VERSION1_TARGET_HEIGHT)
+        version2 = self._resize_to_fixed_size(version2, VERSION2_TARGET_WIDTH, VERSION2_TARGET_HEIGHT)
         return version1, version2
 
     def _crop_to_content(self, image):
@@ -214,47 +227,6 @@ class BackgroundRemover:
 
         logger.info(f"Resized to fixed size: {canvas.size} (no crop, content preserved)")
         return canvas
-
-    def _apply_rounded_bottom(self, image, radius=30):
-        """
-        이미지 하단에 라운드 처리 적용
-
-        Args:
-            image: PIL Image (RGBA)
-            radius: 라운드 반지름 (픽셀)
-
-        Returns:
-            PIL Image: 라운드 처리된 이미지
-        """
-        img_array = np.array(image)
-        height, width = img_array.shape[:2]
-
-        # 라운드 마스크 생성
-        mask = np.ones((height, width), dtype=np.uint8) * 255
-
-        # 하단 좌우 모서리에 라운드 적용
-        # 왼쪽 하단
-        for y in range(height - radius, height):
-            for x in range(radius):
-                dx = radius - x
-                dy = radius - (height - y)
-                if dx * dx + dy * dy > radius * radius:
-                    mask[y, x] = 0
-
-        # 오른쪽 하단
-        for y in range(height - radius, height):
-            for x in range(width - radius, width):
-                dx = x - (width - radius)
-                dy = radius - (height - y)
-                if dx * dx + dy * dy > radius * radius:
-                    mask[y, x] = 0
-
-        # 기존 알파 채널과 마스크 결합
-        alpha_original = img_array[:, :, 3]
-        alpha_combined = np.minimum(alpha_original, mask)
-        img_array[:, :, 3] = alpha_combined
-
-        return Image.fromarray(img_array, 'RGBA')
 
     def _apply_post_processing(self, image):
         """
@@ -336,67 +308,23 @@ class BackgroundRemover:
         img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
 
-        # 얼굴 검출
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+        # 얼굴 검출 (cascade를 캐싱하여 매번 XML 파싱 방지)
+        if self._face_cascade is None:
+            self._face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        faces = self._face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
         if len(faces) == 0:
             logger.warning(f"[{filename}] No face detected")
             return None
 
-        # 유효한 얼굴 필터링
-        valid_faces = []
-        img_height = image.height
-        img_width = image.width
-
-        for (fx, fy, fw, fh) in faces:
-            # 1. 얼굴이 이미지 상단 70% 영역에 있어야 함 (하단은 잘못된 검출 가능성 높음)
-            if fy + fh > img_height * 0.7:
-                logger.info(f"[{filename}] ❌ Rejected face at ({fx}, {fy}, {fw}, {fh}) - too low (bottom > 70%)")
-                continue
-
-            # 2. 얼굴 크기 검증 (해상도 적응형)
-            face_area = fw * fh
-            image_area = img_width * img_height
-
-            # 절대 크기: 최소 50x50 픽셀
-            if fw < 50 or fh < 50:
-                logger.info(f"[{filename}] ❌ Rejected face at ({fx}, {fy}, {fw}, {fh}) - too small (min 50x50)")
-                continue
-
-            # 상대 크기: 해상도에 따라 적응형
-            max_dimension = max(img_width, img_height)
-            if max_dimension < 500:
-                min_ratio = 0.05  # 저해상도: 5%
-            elif max_dimension < 1500:
-                min_ratio = 0.03  # 중해상도: 3%
-            else:
-                min_ratio = 0.01  # 고해상도: 1%
-
-            if face_area < image_area * min_ratio:
-                logger.info(f"[{filename}] ❌ Rejected face at ({fx}, {fy}, {fw}, {fh}) - too small ({face_area}/{image_area} = {face_area/image_area*100:.1f}%, min: {min_ratio*100:.1f}%)")
-                continue
-
-            # 3. 얼굴 비율이 정상 범위여야 함 (너무 길거나 넓으면 오탐지)
-            aspect_ratio = fw / fh
-            if aspect_ratio < 0.6 or aspect_ratio > 1.5:
-                logger.info(f"[{filename}] ❌ Rejected face at ({fx}, {fy}, {fw}, {fh}) - abnormal aspect ratio ({aspect_ratio:.2f})")
-                continue
-
-            valid_faces.append((fx, fy, fw, fh))
-
-        if len(valid_faces) == 0:
-            logger.warning(f"[{filename}] ⚠️  No valid face detected after filtering (found {len(faces)} faces but all rejected)")
-            return None
-
         # 가장 상단에 있고 큰 얼굴 선택 (상단 우선, 크기 차선)
-        face = min(valid_faces, key=lambda f: (f[1], -f[2] * f[3]))
+        face = min(faces, key=lambda f: (f[1], -f[2] * f[3]))
         fx, fy, fw, fh = face
 
         # 어깨선 추정: 얼굴 하단 + 얼굴 높이의 30-40%
         shoulder_y = fy + fh + int(fh * 0.35)
 
-        logger.info(f"[{filename}] ✅ Valid face detected at ({fx}, {fy}, {fw}, {fh}), shoulder_y estimated at {shoulder_y}")
+        logger.info(f"[{filename}] Face detected at ({fx}, {fy}, {fw}, {fh}), shoulder_y estimated at {shoulder_y}")
 
         return {
             'face': face,
@@ -516,96 +444,6 @@ class BackgroundRemover:
         logger.info(f"Normalized from {image.size} to {canvas.size} (scale: {scale_factor:.2f})")
 
         return canvas
-
-    def _create_circular_face_crop(self, image, filename="unknown"):
-        """
-        얼굴 중심 원형 크롭 생성 (귀 기준 양옆 제거)
-
-        Args:
-            image: PIL Image (RGBA)
-            filename: 파일명 (로깅용)
-
-        Returns:
-            PIL Image: 원형 크롭된 이미지
-        """
-        logger.info(f"[{filename}] Creating circular face crop...")
-
-        img_array = np.array(image)
-
-        if len(img_array.shape) < 3 or img_array.shape[2] != 4:
-            logger.warning(f"[{filename}] Image is not RGBA format, returning original")
-            return image
-
-        # 얼굴 감지
-        detection = self._detect_face_and_body(image, filename=filename)
-
-        if detection is None:
-            logger.warning(f"[{filename}] No face detected for circular crop, returning original")
-            return image
-
-        fx, fy, fw, fh = detection['face']
-
-        # 실제 사람 영역의 중심 찾기 (알파 채널 기반)
-        alpha = img_array[:, :, 3]
-        # 얼굴 높이 범위에서의 실제 픽셀 찾기
-        face_region_alpha = alpha[fy:fy+fh, :]
-        person_pixels = np.any(face_region_alpha > 10, axis=0)
-        person_indices = np.where(person_pixels)[0]
-
-        if len(person_indices) > 0:
-            # 실제 사람 영역의 좌우 끝점
-            actual_left = person_indices.min()
-            actual_right = person_indices.max()
-            # 실제 중심
-            face_center_x = (actual_left + actual_right) // 2
-        else:
-            # fallback: 감지된 얼굴 중심
-            face_center_x = fx + fw // 2
-
-        face_center_y = fy + fh // 2
-
-        # 원형 반지름: 얼굴 크기에 1.15배 (얼굴 + 약간의 여백)
-        circle_radius = int(max(fw, fh) * 1.15)
-
-        # 좌우 크롭 범위: 얼굴 너비 기준으로 귀까지만 (얼굴 너비 * 1.1)
-        crop_width_half = int(fw * 0.55)  # 얼굴 중심에서 양옆으로 각각 얼굴너비의 55%
-        crop_left = max(0, face_center_x - crop_width_half)
-        crop_right = min(img_array.shape[1], face_center_x + crop_width_half)
-
-        # 원형 + 좌우 직선 마스크 생성
-        height, width = img_array.shape[:2]
-        mask = np.zeros((height, width), dtype=np.uint8)
-
-        # 1. 전체 원형 그리기
-        cv2.circle(mask, (face_center_x, face_center_y), circle_radius, 255, -1)
-
-        # 2. 좌우를 직사각형으로 제거 (귀 밖 영역)
-        # 왼쪽 제거
-        mask[:, :crop_left] = 0
-        # 오른쪽 제거
-        mask[:, crop_right:] = 0
-
-        # 페더링 (부드러운 경계)
-        mask_float = mask.astype(np.float32) / 255.0
-        mask_blurred = cv2.GaussianBlur(mask_float, (15, 15), 0)
-
-        # 기존 알파 채널과 마스크 결합
-        alpha_original = img_array[:, :, 3].astype(np.float32) / 255.0
-        alpha_combined = alpha_original * mask_blurred
-        img_array[:, :, 3] = (alpha_combined * 255).astype(np.uint8)
-
-        # PIL Image로 변환
-        result_image = Image.fromarray(img_array, 'RGBA')
-
-        # 크롭 영역 계산
-        crop_top = max(0, face_center_y - circle_radius - 10)
-        crop_bottom = min(height, face_center_y + circle_radius + 10)
-
-        result_image = result_image.crop((crop_left, crop_top, crop_right, crop_bottom))
-
-        logger.info(f"[{filename}] Circular crop with vertical edges created (radius: {circle_radius}, width: {crop_right - crop_left})")
-
-        return result_image
 
     def _create_circular_face_crop_from_normalized(self, image, filename="unknown"):
         """
@@ -731,228 +569,35 @@ class BackgroundRemover:
 
         return result_image
 
-    def _create_mediapipe_versions(self, image, filename="unknown"):
-        """
-        MediaPipe 기반 버전 3, 4 생성
-
-        Args:
-            image: PIL Image (RGBA) - 배경 제거된 원본 이미지
-            filename: 파일명 (로깅용)
-
-        Returns:
-            tuple: (version3, version4)
-                - version3: 어깨선까지 포함된 상반신 (MediaPipe)
-                - version4: 얼굴 중심 원형 크롭 (MediaPipe)
-        """
-        logger.info(f"[{filename}] Creating MediaPipe versions...")
-
-        # MediaPipe 감지기 가져오기
-        detector = get_mediapipe_detector()
-
-        if detector is None:
-            logger.warning(f"[{filename}] MediaPipe not available, returning empty images")
-            # 빈 이미지 반환
-            empty = Image.new('RGBA', (100, 100), (0, 0, 0, 0))
-            return empty, empty
-
-        # 얼굴 및 신체 감지
-        detection = detector.detect_face_and_body(image, filename=filename)
-
-        if detection is None:
-            logger.warning(f"[{filename}] MediaPipe detection failed, returning original")
-            return image.copy(), image.copy()
-
-        # Version 3: 상반신 표준화 (MediaPipe)
-        version3 = self._normalize_upper_body_mediapipe(image.copy(), detection, filename=filename)
-
-        # Version 4: 버전3을 기반으로 얼굴 중심 원형 크롭 (MediaPipe)
-        version4 = self._create_circular_face_crop_mediapipe(version3.copy(), detection, filename=filename)
-
-        return version3, version4
-
-    def _normalize_upper_body_mediapipe(self, image, detection, filename="unknown"):
-        """
-        MediaPipe 감지 결과로 상반신 표준화
-        핵심: 손 포즈를 감지해서 제외하고, 얼굴을 중심에 정확히 배치
-
-        Args:
-            image: PIL Image (RGBA)
-            detection: MediaPipe 감지 결과
-            filename: 파일명
-
-        Returns:
-            PIL Image: 정규화된 상반신 이미지
-        """
-        logger.info(f"[{filename}] MediaPipe upper body normalization...")
-
-        img_array = np.array(image)
-        height, width = img_array.shape[:2]
-
-        # 얼굴 정보
+    def _scale_to_face_height(self, image, detection, target_face_height, filename="unknown"):
+        """얼굴 높이를 기준으로 이미지를 스케일링하고 좌표를 재계산"""
+        width, height = image.size
         fx, fy, fw, fh = detection['face_bbox']
         face_center_x, face_center_y = detection['face_center']
 
-        # 어깨 위치 감지
-        shoulders = detection.get('shoulders', [])
+        scale_factor = target_face_height / max(fh, 1)
+        new_width = int(width * scale_factor)
+        new_height = int(height * scale_factor)
+        scaled_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-        if len(shoulders) >= 2:
-            shoulder_y = max(shoulders[0][1], shoulders[1][1])
-            logger.info(f"[{filename}] Both shoulders detected at y={shoulder_y}")
-        elif len(shoulders) == 1:
-            shoulder_y = shoulders[0][1]
-            logger.info(f"[{filename}] One shoulder detected at y={shoulder_y}")
-        else:
-            shoulder_y = fy + int(fh * 2.5)
-            logger.info(f"[{filename}] No shoulders detected, estimated at y={shoulder_y}")
+        scaled_detection = {
+            'fx': int(fx * scale_factor),
+            'fy': int(fy * scale_factor),
+            'fw': int(fw * scale_factor),
+            'fh': int(fh * scale_factor),
+            'face_center_x': int(face_center_x * scale_factor),
+            'face_center_y': int(face_center_y * scale_factor),
+        }
 
-        # 상하 크롭: 머리 위부터 어깨 아래까지
-        crop_top = max(0, fy - int(fh * 0.8))  # 얼굴 위로 여유있게
-        crop_bottom = min(height, shoulder_y + int(fh * 0.3))
-
-        # 좌우 크롭: 얼굴과 어깨만 기준 (손 포즈 제외)
-        # 1. 얼굴+어깨 영역에서만 픽셀 감지
-        alpha = img_array[:, :, 3]
-
-        # 얼굴부터 어깨까지 영역만 검사
-        body_region_alpha = alpha[fy:shoulder_y, :]
-
-        # 손 위치 확인
-        hands = detection.get('hands', [])
-        hand_x_positions = []
-        for hand_x, hand_y in hands:
-            # 어깨 위쪽에 있는 손만 (포즈)
-            if hand_y < shoulder_y:
-                hand_x_positions.append(hand_x)
-                logger.info(f"[{filename}] Hand pose detected at x={hand_x}, y={hand_y} - will exclude from crop")
-
-        # 몸 영역 픽셀 감지 (손 영역 제외)
-        body_pixels = np.any(body_region_alpha > 10, axis=0)
-
-        # 손 영역 마스킹 (손 주변 픽셀 제외)
-        for hand_x in hand_x_positions:
-            # 손 주변 ±fw*0.5 범위 제외
-            exclude_range = int(fw * 0.5)
-            exclude_left = max(0, hand_x - exclude_range)
-            exclude_right = min(width, hand_x + exclude_range)
-            body_pixels[exclude_left:exclude_right] = False
-
-        body_indices = np.where(body_pixels)[0]
-
-        if len(body_indices) > 0:
-            body_left = body_indices.min()
-            body_right = body_indices.max()
-
-            # 얼굴 중심 기준으로 대칭 크롭
-            left_distance = face_center_x - body_left
-            right_distance = body_right - face_center_x
-
-            # 대칭을 위해 큰 쪽 사용 (단, 최대 얼굴 너비의 1.8배로 제한)
-            max_distance = min(max(left_distance, right_distance), int(fw * 1.8))
-
-            crop_left = max(0, face_center_x - max_distance)
-            crop_right = min(width, face_center_x + max_distance)
-
-            logger.info(f"[{filename}] Body crop (excluding hands): left_dist={left_distance}, right_dist={right_distance}, max={max_distance}")
-        else:
-            # fallback: 얼굴만 기준
-            crop_left = max(0, face_center_x - int(fw * 1.5))
-            crop_right = min(width, face_center_x + int(fw * 1.5))
-            logger.info(f"[{filename}] Fallback to face-only crop")
-
-        # 크롭
-        cropped_image = image.crop((crop_left, crop_top, crop_right, crop_bottom))
-
-        # 최종 여백 제거
-        cropped_image = self._crop_to_content(cropped_image)
-
-        logger.info(f"[{filename}] MediaPipe upper body normalized to {cropped_image.size}")
-        return cropped_image
-
-    def _create_circular_face_crop_mediapipe(self, image, detection, filename="unknown"):
-        """
-        MediaPipe 감지 결과로 얼굴 중심 원형 크롭 생성
-        핵심: 손 포즈를 제외하고 얼굴을 중심에 배치, 귀 기준 좌우 크롭
-
-        Args:
-            image: PIL Image (RGBA) - 정규화된 이미지
-            detection: MediaPipe 감지 결과
-            filename: 파일명
-
-        Returns:
-            PIL Image: 원형 크롭된 이미지
-        """
-        logger.info(f"[{filename}] MediaPipe circular face crop...")
-
-        img_array = np.array(image)
-        height, width = img_array.shape[:2]
-
-        # 얼굴 재감지 (정규화된 이미지에서)
-        detector = get_mediapipe_detector()
-        if detector:
-            new_detection = detector.detect_face_and_body(image, filename=filename)
-            if new_detection:
-                detection = new_detection
-
-        fx, fy, fw, fh = detection['face_bbox']
-        face_center_x, face_center_y = detection['face_center']
-
-        # 귀 위치 사용
-        left_ear = detection.get('left_ear')
-        right_ear = detection.get('right_ear')
-
-        # 원형 반지름
-        circle_radius = int(max(fw, fh) * 1.15)
-
-        # 좌우 크롭: 귀 기준 + 머리카락 여유 (손 포즈는 무시)
-        if left_ear and right_ear:
-            # 귀 간격 기준 + 여유
-            ear_width = right_ear[0] - left_ear[0]
-            crop_width_half = int(ear_width * 0.65)  # 0.55 -> 0.65로 증가
-            logger.info(f"[{filename}] Using ear positions for crop width: {crop_width_half}")
-        else:
-            # 얼굴 너비 기준 + 여유
-            crop_width_half = int(fw * 0.75)  # 0.65 -> 0.75로 증가
-            logger.info(f"[{filename}] No ears detected, using face width: {crop_width_half}")
-
-        # 대칭 크롭 (얼굴 중심 기준)
-        crop_left = max(0, face_center_x - crop_width_half)
-        crop_right = min(width, face_center_x + crop_width_half)
-
-        # 원형 마스크
-        mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.circle(mask, (face_center_x, face_center_y), circle_radius, 255, -1)
-
-        # 좌우 제거 (수직선)
-        mask[:, :crop_left] = 0
-        mask[:, crop_right:] = 0
-
-        # 페더링
-        mask_float = mask.astype(np.float32) / 255.0
-        mask_blurred = cv2.GaussianBlur(mask_float, (15, 15), 0)
-
-        # 알파 채널 결합
-        alpha_original = img_array[:, :, 3].astype(np.float32) / 255.0
-        alpha_combined = alpha_original * mask_blurred
-        img_array[:, :, 3] = (alpha_combined * 255).astype(np.uint8)
-
-        result_image = Image.fromarray(img_array, 'RGBA')
-
-        # 크롭
-        crop_top = max(0, face_center_y - circle_radius - 10)
-        crop_bottom = min(height, face_center_y + circle_radius + 10)
-        result_image = result_image.crop((crop_left, crop_top, crop_right, crop_bottom))
-
-        logger.info(f"[{filename}] MediaPipe circular crop created (radius: {circle_radius}, width: {crop_right - crop_left})")
-
-        return result_image
+        logger.info(f"[{filename}] Scaled image from {width}x{height} to {new_width}x{new_height} (scale: {scale_factor:.2f})")
+        return scaled_image, scaled_detection
 
     def _create_final_upper_body(self, image, detection, filename="unknown"):
         """
         최종 버전 1: VS 화면용 어깨선 상반신
-        - MediaPipe로 정확한 어깨/얼굴 감지
-        - 손 포즈 제외
-        - 일관된 크기로 리사이징 (600x800 표준)
-        - 얼굴이 중심에 배치
+        - 얼굴 크기 표준화 (모든 이미지 동일한 얼굴 크기)
+        - 상체 비율 표준화 (얼굴 기준 일정한 비율)
+        - 일관된 크기로 출력 (600x640)
 
         Args:
             image: PIL Image (RGBA)
@@ -964,167 +609,53 @@ class BackgroundRemover:
         """
         logger.info(f"[{filename}] Creating final upper body (Version 1)...")
 
-        img_array = np.array(image)
-        height, width = img_array.shape[:2]
+        # 1. 얼굴 크기 표준화: 모든 얼굴을 동일한 크기로 스케일링
+        scaled_image, sd = self._scale_to_face_height(image, detection, 200, filename)
+        scaled_fy, scaled_fw, scaled_fh = sd['fy'], sd['fw'], sd['fh']
+        scaled_face_center_x = sd['face_center_x']
 
-        # 얼굴 정보
-        fx, fy, fw, fh = detection['face_bbox']
-        face_center_x, face_center_y = detection['face_center']
+        # 2. 일정한 비율로 크롭 (얼굴 기준, 머리카락 포함)
+        scaled_array = np.array(scaled_image)
+        scaled_height, scaled_width = scaled_array.shape[:2]
+        scaled_alpha = scaled_array[:, :, 3]
 
-        # 어깨 위치
-        shoulders = detection.get('shoulders', [])
-        if len(shoulders) >= 2:
-            shoulder_y = max(shoulders[0][1], shoulders[1][1])
-        elif len(shoulders) == 1:
-            shoulder_y = shoulders[0][1]
+        # 실제 콘텐츠 최상단 확인 (머리카락 포함)
+        content_rows = np.any(scaled_alpha > 10, axis=1)
+        content_row_indices = np.where(content_rows)[0]
+
+        if len(content_row_indices) > 0:
+            actual_top = content_row_indices.min()
         else:
-            shoulder_y = fy + int(fh * 2.5)
+            actual_top = scaled_fy
 
-        # 좌우는 전체 이미지 사용 (어깨 전부 포함)
-        alpha = img_array[:, :, 3]
-        crop_left = 0
-        crop_right = width
+        # 상하 크롭: 실제 머리카락 최상단부터 + 얼굴 아래 일정 비율 (어깨 포함)
+        crop_top = max(0, actual_top - 10)  # 머리카락 최상단 + 약간 여유
+        crop_bottom = min(scaled_height, scaled_fy + scaled_fh + int(scaled_fh * 0.5))  # 얼굴 아래 50%
 
-        # 상하 크롭: 실제 콘텐츠 경계 감지
-        crop_region_alpha = alpha
-        row_has_content = np.any(crop_region_alpha > 10, axis=1)
-        content_rows = np.where(row_has_content)[0]
+        # 좌우 크롭: 얼굴 중심 기준으로 일정 범위만 (와이드하게 나오지 않도록)
+        # 얼굴 너비의 1.8배를 최대 폭으로 제한
+        max_half_width = int(scaled_fw * 0.9)  # 얼굴 중심에서 좌우 각각 얼굴 너비의 90%
+        crop_left = max(0, scaled_face_center_x - max_half_width)
+        crop_right = min(scaled_width, scaled_face_center_x + max_half_width)
 
-        if len(content_rows) > 0:
-            # 실제 콘텐츠의 최상단/최하단 (약간 여유 추가)
-            crop_top = max(0, content_rows.min() - 10)
-            crop_bottom = min(height, content_rows.max() + 10)
-            logger.info(f"[{filename}] Content-based crop: top={crop_top}, bottom={crop_bottom}")
-        else:
-            # Fallback: 얼굴 기준
-            crop_top = max(0, fy - int(fh * 0.8))
-            crop_bottom = min(height, shoulder_y + int(fh * 0.3))
-            logger.info(f"[{filename}] Fallback crop (no content detected)")
+        # 크롭 실행
+        result_image = scaled_image.crop((crop_left, crop_top, crop_right, crop_bottom))
 
-        # 크롭
-        cropped = image.crop((crop_left, crop_top, crop_right, crop_bottom))
-
-        # 표준 크기로 리사이징 (STANDARD_OUTPUT_WIDTH x STANDARD_OUTPUT_HEIGHT)
-        # 얼굴이 출력 너비의 37% 차지하도록
-        target_face_width = int(STANDARD_OUTPUT_WIDTH * 0.37)
-        scale_factor = target_face_width / max(fw, 1)
-
-        new_width = int(cropped.width * scale_factor)
-        new_height = int(cropped.height * scale_factor)
-        scaled = cropped.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        # 캔버스에 배치
-        canvas_height = min(STANDARD_OUTPUT_HEIGHT, max(new_height + 100, int(STANDARD_OUTPUT_HEIGHT * 0.10) + new_height))
-        canvas = Image.new('RGBA', (STANDARD_OUTPUT_WIDTH, canvas_height), (0, 0, 0, 0))
-
-        paste_x = (STANDARD_OUTPUT_WIDTH - new_width) // 2
-        paste_y = int(canvas_height * 0.08)
-
-        # 높이/너비 오버플로우 처리
-        if paste_y + new_height > canvas_height:
-            scaled = scaled.crop((0, 0, new_width, canvas_height - paste_y))
-        if new_width > STANDARD_OUTPUT_WIDTH:
-            paste_x = 0
-            scaled = scaled.crop(((new_width - STANDARD_OUTPUT_WIDTH) // 2, 0,
-                                 (new_width + STANDARD_OUTPUT_WIDTH) // 2, scaled.height))
-
-        canvas.paste(scaled, (paste_x, paste_y), scaled)
-
-        # 고정 크기로 리사이징 (손이 위에 있는 경우를 위해 crop 제거)
-        canvas = self._resize_to_fixed_size(canvas, VERSION1_TARGET_WIDTH, VERSION1_TARGET_HEIGHT)
-
-        logger.info(f"[{filename}] Final upper body created: {canvas.size}")
-        return canvas
-
-    def _create_final_circular_crop(self, image, detection, filename="unknown"):
-        """
-        최종 버전 2: 시상 내역용 얼굴 원형 크롭
-        - MediaPipe로 정확한 귀 위치 감지
-        - 머리카락이 긴 경우 머리카락 포함
-        - 손 포즈 제외
-        - 양옆 수직 제거
-        - 얼굴이 중심에 배치
-
-        Args:
-            image: PIL Image (RGBA) - 버전1 이미지
-            detection: MediaPipe 감지 결과
-            filename: 파일명
-
-        Returns:
-            PIL Image: 시상용 원형 이미지
-        """
-        logger.info(f"[{filename}] Creating final circular crop (Version 2)...")
-
-        img_array = np.array(image)
-        height, width = img_array.shape[:2]
-
-        # 얼굴 재감지 (버전1 이미지에서)
-        detector = get_mediapipe_detector()
-        if detector:
-            new_detection = detector.detect_face_and_body(image, filename=filename)
-            if new_detection:
-                detection = new_detection
-
-        fx, fy, fw, fh = detection['face_bbox']
-        face_center_x, face_center_y = detection['face_center']
-
-        # 원형 반지름
-        circle_radius = int(max(fw, fh) * 1.15)
-
-        # 귀 위치 기반 좌우 크롭
-        left_ear = detection.get('left_ear')
-        right_ear = detection.get('right_ear')
-
-        if left_ear and right_ear:
-            ear_width = right_ear[0] - left_ear[0]
-            crop_width_half = int(ear_width * 0.65)
-        else:
-            crop_width_half = int(fw * 0.75)
-
-        # 대칭 크롭
-        crop_left = max(0, face_center_x - crop_width_half)
-        crop_right = min(width, face_center_x + crop_width_half)
-
-        # 원형 마스크
-        mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.circle(mask, (face_center_x, face_center_y), circle_radius, 255, -1)
-
-        # 양옆 수직 제거
-        mask[:, :crop_left] = 0
-        mask[:, crop_right:] = 0
-
-        # 페더링
-        mask_float = mask.astype(np.float32) / 255.0
-        mask_blurred = cv2.GaussianBlur(mask_float, (15, 15), 0)
-
-        # 알파 채널 결합
-        alpha_original = img_array[:, :, 3].astype(np.float32) / 255.0
-        alpha_combined = alpha_original * mask_blurred
-        img_array[:, :, 3] = (alpha_combined * 255).astype(np.uint8)
-
-        result_image = Image.fromarray(img_array, 'RGBA')
-
-        # 크롭
-        crop_top = max(0, face_center_y - circle_radius - 10)
-        crop_bottom = min(height, face_center_y + circle_radius + 10)
-        result_image = result_image.crop((crop_left, crop_top, crop_right, crop_bottom))
-
-        # 고정 너비로 리사이징 (비율 유지)
-        if result_image.width != VERSION2_TARGET_WIDTH:
-            scale = VERSION2_TARGET_WIDTH / result_image.width
+        # 3. 너비만 고정, 높이는 비율 유지 (여백 없음)
+        if result_image.width != VERSION1_TARGET_WIDTH:
+            scale = VERSION1_TARGET_WIDTH / result_image.width
             new_height = int(result_image.height * scale)
-            result_image = result_image.resize((VERSION2_TARGET_WIDTH, new_height), Image.Resampling.LANCZOS)
-            logger.info(f"[{filename}] Resized to fixed width: {result_image.size}")
+            result_image = result_image.resize((VERSION1_TARGET_WIDTH, new_height), Image.Resampling.LANCZOS)
 
-        logger.info(f"[{filename}] Final circular crop created: {result_image.size}")
+        logger.info(f"[{filename}] Final upper body created: {result_image.size}")
         return result_image
 
     def _create_final_circular_crop_wide(self, image, detection, filename="unknown"):
         """
-        최종 버전 2: 시상 내역용 얼굴+상반신 크롭
-        - 버전1 이미지를 기반으로 귀 너비 기준으로 좌우 크롭
-        - 상하는 실제 콘텐츠 경계까지
-        - 최소/최대 크기에 맞게 리사이징
+        최종 버전 2: 시상 내역용 얼굴 타원형 크롭
+        - 얼굴 크기를 표준화하여 모든 이미지의 얼굴 크기를 일정하게 만듦
+        - 타원형 마스크를 적용하여 배경 제거
+        - 얼굴을 중심에 배치
 
         Args:
             image: PIL Image (RGBA) - 버전1 이미지 (상반신)
@@ -1132,162 +663,99 @@ class BackgroundRemover:
             filename: 파일명
 
         Returns:
-            PIL Image: 시상용 얼굴+상반신 이미지
+            PIL Image: 시상용 타원형 얼굴 이미지
         """
-        logger.info(f"[{filename}] Creating for_award crop from version1...")
+        logger.info(f"[{filename}] Creating elliptical face crop from version1...")
 
-        img_array = np.array(image)
-        height, width = img_array.shape[:2]
-        alpha = img_array[:, :, 3]
+        # 1. 얼굴 크기 표준화: 모든 얼굴을 동일한 크기로 스케일링
+        scaled_image, sd = self._scale_to_face_height(image, detection, 300, filename)
+        scaled_fy, scaled_fw, scaled_fh = sd['fy'], sd['fw'], sd['fh']
+        scaled_face_center_x = sd['face_center_x']
+        scaled_face_center_y = sd['face_center_y']
 
-        # 얼굴 재감지 (버전1 이미지에서)
-        detector = get_mediapipe_detector()
-        if detector:
-            new_detection = detector.detect_face_and_body(image, filename=filename)
-            if new_detection:
-                detection = new_detection
-
-        # 귀 위치 기준으로 좌우 크롭 범위 결정
-        left_ear = detection.get('left_ear')
-        right_ear = detection.get('right_ear')
-        fx, fy, fw, fh = detection['face_bbox']
-        face_center_x = detection['face_center'][0]
-
-        if left_ear and right_ear:
-            # 귀 기준 + 약간 여유
-            ear_left = left_ear[0]
-            ear_right = right_ear[0]
-            padding = int((ear_right - ear_left) * 0.3)  # 귀 너비의 30% 여유
-            crop_left = max(0, ear_left - padding)
-            crop_right = min(width, ear_right + padding)
-            logger.info(f"[{filename}] Crop based on ears: left={crop_left}, right={crop_right}")
-        else:
-            # Fallback: 얼굴 중심 기준
-            half_width = int(fw * 0.9)
-            crop_left = max(0, face_center_x - half_width)
-            crop_right = min(width, face_center_x + half_width)
-            logger.info(f"[{filename}] Crop based on face center (no ears detected)")
-
-        # 상하 크롭: 실제 콘텐츠 경계 찾기
-        # 각 행에 픽셀이 있는지 확인
-        row_has_content = np.any(alpha[:, crop_left:crop_right] > 10, axis=1)
-        content_rows = np.where(row_has_content)[0]
-
-        if len(content_rows) > 0:
-            crop_top = max(0, content_rows.min() - 10)  # 위쪽 약간 여유
-            crop_bottom = min(height, content_rows.max() + 10)  # 아래쪽 약간 여유
-        else:
-            # Fallback
-            crop_top = 0
-            crop_bottom = height
-
-        # 크롭 실행
-        result_image = image.crop((crop_left, crop_top, crop_right, crop_bottom))
-        logger.info(f"[{filename}] Cropped to content: {result_image.size}")
-
-        # 최소/최대 크기 제한
-        min_width = 250
-        max_width = 350
-        min_height = 400
-        max_height = 600
-
-        current_width = result_image.width
-        current_height = result_image.height
-
-        # 너비/높이 비율 계산
-        width_scale = 1.0
-        height_scale = 1.0
-
-        if current_width < min_width:
-            width_scale = min_width / current_width
-        elif current_width > max_width:
-            width_scale = max_width / current_width
-
-        if current_height < min_height:
-            height_scale = min_height / current_height
-        elif current_height > max_height:
-            height_scale = max_height / current_height
-
-        # 더 작은 스케일 사용 (둘 다 제한 안에 들어오도록)
-        scale = min(width_scale, height_scale)
-
-        if abs(scale - 1.0) > 0.01:  # 스케일이 필요한 경우
-            new_width = int(current_width * scale)
-            new_height = int(current_height * scale)
-            result_image = result_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            logger.info(f"[{filename}] Resized to fit constraints: {result_image.size}")
-
-        logger.info(f"[{filename}] Final for_award image created: {result_image.size}")
-        return result_image
-
-    def _enhance_image_quality(self, image, filename="unknown"):
-        """
-        이미지 품질 향상 (노이즈 제거 + 자동 밝기 + 2x 업스케일)
-
-        Args:
-            image: PIL Image (RGBA)
-            filename: 파일명 (로깅용)
-
-        Returns:
-            PIL Image: 품질이 향상된 이미지
-        """
-        logger.info(f"[{filename}] Enhancing image quality...")
-
-        original_size = image.size
-
-        # 알파 채널 분리
-        if image.mode == 'RGBA':
-            alpha = image.split()[3]
-            rgb_image = image.convert('RGB')
-        else:
-            alpha = None
-            rgb_image = image
-
+        # 2. 타원형 마스크 생성
         # numpy 배열로 변환
-        img_array = np.array(rgb_image)
-        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        scaled_array = np.array(scaled_image)
+        scaled_height, scaled_width = scaled_array.shape[:2]
+        scaled_alpha = scaled_array[:, :, 3]
 
-        # 1. 노이즈 제거 (Non-local Means Denoising - 고품질)
-        denoised = cv2.fastNlMeansDenoisingColored(img_bgr, None, 10, 10, 7, 21)
+        # 실제 콘텐츠 영역 확인 (머리카락 포함)
+        content_rows = np.any(scaled_alpha > 10, axis=1)
+        content_row_indices = np.where(content_rows)[0]
 
-        # 2. 자연스러운 밝기 자동 조절
-        lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
+        if len(content_row_indices) > 0:
+            actual_top = content_row_indices.min()
+        else:
+            actual_top = scaled_fy
 
-        # 평균 밝기 확인
-        avg_brightness = np.mean(l)
+        # 타원의 크기 계산 (실제 콘텐츠 기준)
+        # 가로 반지름: 얼굴 너비의 75% (귀 포함)
+        ellipse_radius_x = int(scaled_fw * 0.75)
 
-        # 어두운 이미지만 보정 (평균 밝기 < 120)
-        if avg_brightness < 120:
-            # 매우 약한 CLAHE (자연스럽게)
-            clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-            l_enhanced = clahe.apply(l)
-            # 원본과 블렌딩 (70% 원본 + 30% 보정)
-            l = cv2.addWeighted(l, 0.7, l_enhanced, 0.3, 0)
-            logger.info(f"[{filename}] Brightness adjusted (avg: {avg_brightness:.1f})")
+        # 세로 반지름: 가로의 1.5배 - 상체가 조금 더 포함되도록
+        ellipse_radius_y = int(ellipse_radius_x * 1.5)
 
-        lab_adjusted = cv2.merge([l, a, b])
-        img_adjusted = cv2.cvtColor(lab_adjusted, cv2.COLOR_LAB2BGR)
+        # 타원 중심: 머리카락이 잘리지 않도록 조정
+        # 머리카락 최상단부터 타원 중심까지의 거리가 세로 반지름보다 작아야 함
+        head_top_to_center = ellipse_radius_y - int(scaled_fh * 0.6)  # 위쪽은 적게, 아래쪽은 많이
+        ellipse_center_y = actual_top + head_top_to_center
+        ellipse_center_x = scaled_face_center_x
 
-        # RGB로 변환
-        img_rgb = cv2.cvtColor(img_adjusted, cv2.COLOR_BGR2RGB)
-        enhanced = Image.fromarray(img_rgb)
+        # 타원 중심이 얼굴보다 약간 아래로 (상체가 더 나오도록)
+        min_center_y = scaled_face_center_y - int(scaled_fh * 0.2)
+        max_center_y = scaled_face_center_y + int(scaled_fh * 0.4)
+        ellipse_center_y = max(min_center_y, min(ellipse_center_y, max_center_y))
 
-        # 알파 채널 복원
-        if alpha is not None:
-            enhanced = enhanced.convert('RGBA')
-            enhanced.putalpha(alpha)
+        # 타원형 마스크 생성
+        mask = np.zeros((scaled_height, scaled_width), dtype=np.uint8)
+        cv2.ellipse(
+            mask,
+            (ellipse_center_x, ellipse_center_y),
+            (ellipse_radius_x, ellipse_radius_y),
+            0,  # 회전 각도
+            0,  # 시작 각도
+            360,  # 끝 각도
+            255,  # 색상
+            -1  # 채우기
+        )
 
-        # 3. 2배 업스케일 (LANCZOS)
-        new_width = original_size[0] * 2
-        new_height = original_size[1] * 2
-        upscaled = enhanced.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        # 페더링 (부드러운 경계)
+        mask_float = mask.astype(np.float32) / 255.0
+        mask_blurred = cv2.GaussianBlur(mask_float, (21, 21), 0)
 
-        # 4. 미세한 선명도 향상
-        upscaled = upscaled.filter(ImageFilter.UnsharpMask(radius=1, percent=50, threshold=3))
+        # 기존 알파 채널과 마스크 결합
+        alpha_original = scaled_array[:, :, 3].astype(np.float32) / 255.0
+        alpha_combined = alpha_original * mask_blurred
+        scaled_array[:, :, 3] = (alpha_combined * 255).astype(np.uint8)
 
-        logger.info(f"[{filename}] Enhanced from {original_size} to {upscaled.size}")
-        return upscaled
+        result_image = Image.fromarray(scaled_array, 'RGBA')
+
+        # 3. 타원 영역만 크롭
+        crop_left = max(0, ellipse_center_x - ellipse_radius_x - 20)
+        crop_right = min(scaled_width, ellipse_center_x + ellipse_radius_x + 20)
+        crop_top = max(0, ellipse_center_y - ellipse_radius_y - 20)
+        crop_bottom = min(scaled_height, ellipse_center_y + ellipse_radius_y + 20)
+
+        result_image = result_image.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+        logger.info(f"[{filename}] Elliptical crop created: {result_image.size}, ellipse: ({ellipse_radius_x}x{ellipse_radius_y})")
+
+        # 4. 최종 크기 조정 (너무 크거나 작지 않도록)
+        max_width = 400
+        max_height = 500
+
+        if result_image.width > max_width or result_image.height > max_height:
+            # 비율 유지하면서 크기 조정
+            width_ratio = max_width / result_image.width
+            height_ratio = max_height / result_image.height
+            scale = min(width_ratio, height_ratio)
+
+            final_width = int(result_image.width * scale)
+            final_height = int(result_image.height * scale)
+            result_image = result_image.resize((final_width, final_height), Image.Resampling.LANCZOS)
+            logger.info(f"[{filename}] Final resize to: {result_image.size}")
+
+        return result_image
 
     def process_image(self, input_path, output_path):
         """

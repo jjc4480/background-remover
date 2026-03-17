@@ -1,9 +1,13 @@
 import json
 import boto3
 import os
+import urllib.parse
 from io import BytesIO
 from PIL import Image
 import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # Disable numba caching for Lambda environment
 os.environ['NUMBA_CACHE_DIR'] = '/tmp'
@@ -24,15 +28,14 @@ model_dst = f'{u2net_cache}/birefnet-general.onnx'
 
 if not os.path.exists(model_dst):
     os.makedirs(u2net_cache, exist_ok=True)
-    # Docker 이미지에 모델이 있으면 복사, 없으면 나중에 자동 다운로드됨
     if os.path.exists(model_src):
         try:
             shutil.copy2(model_src, model_dst)
-            print(f"BiRefNet model copied: {model_src} -> {model_dst}")
+            logger.info(f"BiRefNet model copied: {model_src} -> {model_dst}")
         except Exception as e:
-            print(f"Warning: Failed to copy model: {e}")
+            logger.warning(f"Failed to copy model: {e}")
     else:
-        print(f"Model not found at {model_src}, will download on first use")
+        logger.warning(f"Model not found at {model_src}, will download on first use")
 os.environ['U2NET_HOME'] = u2net_cache
 
 # MediaPipe 모델을 /opt에서 import하도록 sys.path 추가
@@ -40,21 +43,31 @@ if '/opt' not in sys.path:
     sys.path.insert(0, '/opt')
 
 from background_remover import BackgroundRemover
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+from botocore.exceptions import ClientError
 
 s3_client = boto3.client('s3')
+bg_remover = BackgroundRemover(model='birefnet-general')
+
+
+def _upload_png(image, bucket, key):
+    """PIL Image를 PNG로 S3에 업로드"""
+    buffer = BytesIO()
+    image.save(buffer, format='PNG')
+    s3_client.put_object(Bucket=bucket, Key=key, Body=buffer.getvalue(), ContentType='image/png')
+    logger.info(f"Uploaded: {key}")
+
 
 def lambda_handler(event, context):
     """
     Lambda function to remove background from images uploaded to S3
     """
-    try:
-        # Parse S3 event
-        for record in event['Records']:
+    results = []
+    errors = []
+
+    for record in event['Records']:
+        try:
             bucket = record['s3']['bucket']['name']
-            key = record['s3']['object']['key']
+            key = urllib.parse.unquote_plus(record['s3']['object']['key'])
 
             # Check if image is in static/competition/applicant path
             if not key.startswith('static/competition/applicant/'):
@@ -72,14 +85,21 @@ def lambda_handler(event, context):
             name_without_ext = os.path.splitext(filename)[0]
             bg_removed_key = f"{directory}/{name_without_ext}_bg_removed.png"
 
+            # Ensure we have entry_no from path (static/competition/applicant/[entry_no]/filename)
+            path_parts = key.split('/')
+            if len(path_parts) < 5:
+                logger.error(f"Invalid path structure: {key}. Expected: static/competition/applicant/[entry_no]/filename")
+                continue
+
             # Check if bg_removed version exists (indicates already processed)
             try:
                 s3_client.head_object(Bucket=bucket, Key=bg_removed_key)
                 logger.info(f"Skipping - already processed (bg_removed exists): {key}")
                 continue
-            except:
-                # bg_removed doesn't exist, proceed with processing
-                pass
+            except ClientError as e:
+                if e.response['Error']['Code'] != '404':
+                    raise
+                # 404 = bg_removed doesn't exist, proceed with processing
 
             logger.info(f"Processing image: {bucket}/{key}")
 
@@ -90,64 +110,27 @@ def lambda_handler(event, context):
             # Open image
             input_image = Image.open(BytesIO(image_data))
 
-            # Initialize background remover with BiRefNet model
-            bg_remover = BackgroundRemover(model='birefnet-general')
-
             # Remove background (returns tuple: version1, version2)
             version1, version2 = bg_remover.remove_background(input_image, filename=filename)
 
             # Upload processed images to S3
-            # Extract path components: static/competition/applicant/[entry_no]/filename
-            path_parts = key.split('/')
-            filename = os.path.basename(key)
-            name_without_ext = os.path.splitext(filename)[0]
-
-            # Ensure we have entry_no from path (static/competition/applicant/[entry_no]/filename)
-            if len(path_parts) < 5:  # Need at least static/competition/applicant/entry_no/filename
-                logger.error(f"Invalid path structure: {key}. Expected: static/competition/applicant/[entry_no]/filename")
-                continue
-
-            directory = '/'.join(path_parts[:-1])  # Get directory path without filename
-
-            # Save version 1: _bg_removed.png (600x640 상반신)
-            buffer1 = BytesIO()
-            version1.save(buffer1, format='PNG')
-            buffer1.seek(0)
-            output_key1 = f"{directory}/{name_without_ext}_bg_removed.png"
-            s3_client.put_object(
-                Bucket=bucket,
-                Key=output_key1,
-                Body=buffer1.getvalue(),
-                ContentType='image/png'
-            )
-            logger.info(f"Version 1 (bg_removed) saved: {output_key1}")
-
-            # Save version 2: _bg_removed_for_award.png (시상용)
-            buffer2 = BytesIO()
-            version2.save(buffer2, format='PNG')
-            buffer2.seek(0)
-            output_key2 = f"{directory}/{name_without_ext}_bg_removed_for_award.png"
-            s3_client.put_object(
-                Bucket=bucket,
-                Key=output_key2,
-                Body=buffer2.getvalue(),
-                ContentType='image/png'
-            )
-            logger.info(f"Version 2 (for_award) saved: {output_key2}")
-
-            # Original file remains as is
-            logger.info(f"Original file kept: {key}")
+            _upload_png(version1, bucket, f"{directory}/{name_without_ext}_bg_removed.png")
+            _upload_png(version2, bucket, f"{directory}/{name_without_ext}_bg_removed_for_award.png")
 
             logger.info(f"Processing completed for: {key}")
+            results.append(key)
 
-        return {
-            'statusCode': 200,
-            'body': json.dumps('Background removal completed successfully')
-        }
+        except Exception as e:
+            error_key = record.get('s3', {}).get('object', {}).get('key', 'unknown')
+            logger.error(f"Error processing {error_key}: {str(e)}", exc_info=True)
+            errors.append(f"{error_key}: {str(e)}")
 
-    except Exception as e:
-        logger.error(f"Error processing image: {str(e)}")
+    if errors:
         return {
-            'statusCode': 500,
-            'body': json.dumps(f'Error: {str(e)}')
+            'statusCode': 207,
+            'body': json.dumps({'processed': results, 'errors': errors})
         }
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Background removal completed successfully')
+    }

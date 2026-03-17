@@ -1,43 +1,8 @@
-# Python cache files
-*.pyc
-*.pyo
-*.pyd
-__pycache__/
+# Exclude everything
+*
 
-# Git files
-.git
-.gitignore
-
-# Environment files
-.env
-.env.example
-venv/
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS files
-.DS_Store
-Thumbs.db
-*.log
-
-# Test files and directories
-bg_remove_test_images/
-tests/
-test-event.json
-
-# Documentation
-README.md
-
-# Scripts (not needed in container)
-scripts/
-deploy.sh
-
-# Config files (not needed in container)
-config/
-
-# Local runner (not needed in Lambda container)
-src/local_runner.py
+# Include only what Dockerfile needs
+!requirements.txt
+!src/lambda_function.py
+!src/background_remover.py
+!src/mediapipe_face_detector.py

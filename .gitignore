@@ -54,6 +54,12 @@ test_*.webp
 *.log
 logs/
 bg_remove_log.txt
+process_log.txt
+
+# Local test files
+download_models.py
+models/
+static/
 
 # Environment
 .env
