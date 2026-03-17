@@ -34,7 +34,9 @@ def process_single_image(input_path, output_path=None, model='birefnet-general')
 
     # 출력 경로 생성
     if output_path is None:
-        output_path = input_path.parent / f"{input_path.stem}_bg_removed.png"
+        output_dir = Path("bg_remove_test_out")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{input_path.stem}_bg_removed.png"
     else:
         output_path = Path(output_path)
 
@@ -79,30 +81,37 @@ def process_directory(input_dir, output_dir=None, model='birefnet-general'):
     # 지원되는 이미지 확장자
     supported_formats = {'.jpg', '.jpeg', '.png', '.webp'}
 
-    # 이미지 파일 찾기
-    image_files = [
-        f for f in input_dir.iterdir()
-        if f.suffix.lower() in supported_formats and '_bg_removed' not in f.name
-    ]
+    # 이미지 파일 찾기 (재귀적으로 하위 디렉토리 포함)
+    image_files = []
+    for ext in supported_formats:
+        image_files.extend(input_dir.rglob(f'*{ext}'))
+
+    # 이미 처리된 파일 제외
+    image_files = [f for f in image_files if '_bg_removed' not in f.name]
 
     if not image_files:
         logger.info(f"처리할 이미지가 없습니다: {input_dir}")
         return
 
-    logger.info(f"{len(image_files)}개 이미지 발견")
+    logger.info(f"{len(image_files)}개 이미지 발견 (하위 디렉토리 포함)")
 
     # 배경 제거 처리
     bg_remover = BackgroundRemover(model=model)
 
     for img_file in image_files:
-        output_file = output_dir / f"{img_file.stem}_bg_removed.png"
+        # 상대 경로 유지 (하위 디렉토리 구조 보존)
+        relative_path = img_file.relative_to(input_dir)
+        output_file = output_dir / relative_path.parent / f"{img_file.stem}_bg_removed.png"
+
+        # 출력 디렉토리 생성
+        output_file.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            logger.info(f"Processing: {img_file.name}")
+            logger.info(f"Processing: {relative_path}")
             bg_remover.process_image(str(img_file), str(output_file))
 
         except Exception as e:
-            logger.error(f"오류 발생 ({img_file.name}): {e}")
+            logger.error(f"오류 발생 ({relative_path}): {e}")
             continue
 
     logger.info("모든 이미지 처리 완료!")
